@@ -2,13 +2,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .ipynb_checkpoints/
-data/raw/
-data/labeled/
-data/export/
-data/checkpoints/
-data/runs/
-data/collected/
-data/*.onnx
+data
 *.pt
 *.pth
 *.ckpt
@@ -18,3 +12,4 @@ token.json
 .session_cookies.json
 notebooks
 scripts
+target
