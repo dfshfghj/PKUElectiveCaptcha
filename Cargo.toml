@@ -9,8 +9,8 @@ chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 image = "0.25"
-ndarray = "0.17"
-ort = { version = "2.0.0-rc.13", features = ["download-binaries"] }
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
 reqwest = { version = "0.12", features = ["blocking", "cookies", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

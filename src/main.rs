@@ -5,7 +5,7 @@ use image::{imageops::FilterType, DynamicImage};
 use ndarray::Array4;
 use ort::{session::Session, value::TensorRef};
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{CONTENT_TYPE, COOKIE, REFERER, SET_COOKIE, USER_AGENT};
+use reqwest::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, COOKIE, REFERER, SET_COOKIE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ const CAPTCHA_URL: &str = "https://elective.pku.edu.cn/elective2008/DrawServlet"
 const VERIFY_URL: &str = "https://elective.pku.edu.cn/elective2008/edu/pku/stu/elective/controller/supplement/validate.do";
 const HELP_TITLE: &str = "<title>帮助-总体流程</title>";
 const USER_AGENT_VALUE: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/98 Safari/537.36";
+const CACHE_CONTROL_VALUE: &str = "max-age=0";
 const CHARSET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const BATCH_SIZE: usize = 15;
 
@@ -57,16 +58,22 @@ struct CookieFile {
 struct HttpSession {
     client: Client,
     cookies: HashMap<String, String>,
+    manual_cookie_header: bool,
 }
 
 impl HttpSession {
     fn new(cookies: HashMap<String, String>) -> Result<Self> {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
+            // The elective server is an old HTTP/1.1 Java application. Keep
+            // the transport identical to Python requests; HTTP/2 can make
+            // its session affinity fail even when JSESSIONID is present.
+            .http1_only()
             .cookie_store(true)
             .timeout(Duration::from_secs(20))
             .build()?;
-        Ok(Self { client, cookies })
+        let manual_cookie_header = !cookies.is_empty();
+        Ok(Self { client, cookies, manual_cookie_header })
     }
 
     fn cookie_header(&self) -> String {
@@ -93,12 +100,18 @@ impl HttpSession {
         let cookie = self.cookie_header();
         let mut last_error = None;
         for attempt in 0..3 {
-            let result = self.client.get(url)
+            let mut request = self.client.get(url)
                 .query(query)
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .header(REFERER, HOME_URL)
-                .header(COOKIE, cookie.clone())
-                .send();
+                .header(CACHE_CONTROL, CACHE_CONTROL_VALUE)
+                .header(ACCEPT, "*/*");
+            // Do not send an empty Cookie header. Python requests omits it
+            // when the session has no cookies, which matters to the SSO flow.
+            if self.manual_cookie_header && !cookie.is_empty() {
+                request = request.header(COOKIE, cookie.clone());
+            }
+            let result = request.send();
             match result {
                 Ok(response) => {
                     self.record_cookies(&response);
@@ -116,23 +129,43 @@ impl HttpSession {
 
     fn post_form(&mut self, url: &str, form: &[(&str, &str)]) -> Result<Response> {
         let cookie = self.cookie_header();
-        let response = self.client.post(url)
+        let mut request = self.client.post(url)
             .form(form)
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(REFERER, HOME_URL)
-            .header(COOKIE, cookie)
-            .send()?;
+            .header(CACHE_CONTROL, CACHE_CONTROL_VALUE)
+            .header(ACCEPT, "*/*");
+        if self.manual_cookie_header && !cookie.is_empty() {
+            request = request.header(COOKIE, cookie.clone());
+        }
+        let response = request.send()?;
         self.record_cookies(&response);
         Ok(response)
     }
 }
 
+fn verify_alive(session: &mut HttpSession) -> Result<bool> {
+    let response = session.get(HOME_URL, &[])?;
+    Ok(response.status().is_success() && response.text()?.contains(HELP_TITLE))
+}
+
 fn authenticate(session: &mut HttpSession, username: &str, password: &str, channel: Option<&str>) -> Result<()> {
-    let response = session.post_form(LOGIN_URL, &[
+    let login_cookie = format!("userName={username}");
+    let response = session
+        .client
+        .post(LOGIN_URL)
+        .form(&[
         ("appid", "syllabus"), ("userName", username), ("password", password),
         ("randCode", ""), ("smsCode", ""), ("otpCode", ""),
         ("redirUrl", "http://elective.pku.edu.cn:80/elective2008/agent4Iaaa.jsp/../ssoLogin.do"),
-    ])?;
+        ])
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(REFERER, HOME_URL)
+        .header(CACHE_CONTROL, CACHE_CONTROL_VALUE)
+        .header(ACCEPT, "*/*")
+        .header(COOKIE, login_cookie)
+        .send()?;
+    session.record_cookies(&response);
     let payload: serde_json::Value = response.json()?;
     if payload.get("success").and_then(|value| value.as_bool()) != Some(true) {
         bail!("login failed: {payload}");
@@ -167,11 +200,12 @@ fn load_cookies(path: &Path) -> Result<HashMap<String, String>> {
 fn fetch_captcha(session: &mut HttpSession) -> Result<Vec<u8>> {
     let response = session.get(CAPTCHA_URL, &[("Rand", "0.1")])?;
     if !response.status().is_success() { bail!("captcha request failed: {}", response.status()); }
-    if response.headers().get(CONTENT_TYPE).and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase().starts_with("text/html")) == Some(true) {
+    let content_type = response.headers().get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok()).unwrap_or("<missing>").to_string();
+    let body = response.bytes()?.to_vec();
+    if content_type.to_ascii_lowercase().starts_with("text/html") {
         bail!("captcha response is HTML; login session has expired");
     }
-    let body = response.bytes()?.to_vec();
     image::load_from_memory(&body).context("captcha response is not a valid image; login session has expired")?;
     Ok(body)
 }
@@ -263,14 +297,17 @@ fn collect(args: &Command) -> Result<()> {
     let Command::Collect { username, password, channel, count, delay, output_dir, cookies_file, model, reuse_cookies, images_only } = args;
     let username = username.clone().or_else(|| std::env::var("HEED_USERNAME").ok()).context("missing username")?;
     let password = password.clone().or_else(|| std::env::var("HEED_PASSWORD").ok()).or_else(|| { print!("password: "); io::stdout().flush().ok(); let mut value=String::new(); io::stdin().read_line(&mut value).ok()?; Some(value.trim().to_string()) }).filter(|value| !value.is_empty()).context("missing password")?;
-    let cookies = if *reuse_cookies { load_cookies(cookies_file)? } else { HashMap::new() };
-    let mut session = HttpSession::new(cookies)?;
+    let loaded_cookies = if *reuse_cookies { load_cookies(cookies_file)? } else { HashMap::new() };
+    let reuse_loaded = *reuse_cookies && !loaded_cookies.is_empty();
+    let mut session = HttpSession::new(loaded_cookies)?;
     fs::create_dir_all(output_dir.join("raw"))?;
     fs::create_dir_all(output_dir.join("auto_labeled"))?;
     fs::create_dir_all(output_dir.join("review"))?;
     let mut model_instance = if *images_only { None } else { Some(CaptchaModel::load(model)?) };
-    authenticate(&mut session, &username, &password, channel.as_deref())?;
-    save_cookies(cookies_file, &session.cookies)?;
+    if !reuse_loaded || !verify_alive(&mut session)? {
+        authenticate(&mut session, &username, &password, channel.as_deref())?;
+        save_cookies(cookies_file, &session.cookies)?;
+    }
     let mut correct = 0usize;
     for index in 1..=*count {
         let image = fetch_captcha(&mut session)?;
