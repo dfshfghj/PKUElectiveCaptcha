@@ -84,6 +84,7 @@ class AuthError(RuntimeError):
 
 
 OCR_CHARSETS = {
+    21: "2345678abcdefgmnpwxy",
     37: "0123456789abcdefghijklmnopqrstuvwxyz",
     63: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
 }
@@ -103,7 +104,7 @@ class CaptchaOCR:
         except KeyError as exc:
             raise ValueError(
                 f"unsupported OCR output class count: {class_count}; "
-                "expected 37 or 63"
+                "expected 21, 37, or 63"
             ) from exc
         self.input_name = self.session.get_inputs()[0].name
 
@@ -157,10 +158,12 @@ class CaptchaOCR:
         logits = self.session.run(
             None, {self.input_name: self._prepare(image_bytes, blue_filter)}
         )[0]
+        if logits.ndim != 3 or logits.shape[1] != 1:
+            raise ValueError(f"unsupported OCR output shape: {logits.shape}")
         probabilities = self._softmax(logits[:, 0, :])
         beam: dict[tuple[str, ...], tuple[float, float]] = {(): (1.0, 0.0)}
         for distribution in probabilities:
-            top_indices = np.argsort(distribution)[-20:][::-1]
+            top_indices = np.argsort(distribution)[-min(20, len(distribution)) :][::-1]
             next_beam: dict[tuple[str, ...], list[float]] = {}
             for prefix, (blank_score, text_score) in beam.items():
                 for index in top_indices:
