@@ -15,9 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import ddddocr
 import cv2
 import numpy as np
+import onnxruntime as ort
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
@@ -81,6 +81,113 @@ class Credentials:
 
 class AuthError(RuntimeError):
     pass
+
+
+OCR_CHARSETS = {
+    37: "0123456789abcdefghijklmnopqrstuvwxyz",
+    63: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+}
+
+
+class CaptchaOCR:
+    def __init__(self, model_path: Path):
+        if not model_path.is_file():
+            raise FileNotFoundError(f"OCR model not found: {model_path}")
+        self.session = ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
+        )
+        output_shape = self.session.get_outputs()[0].shape
+        class_count = output_shape[-1]
+        try:
+            self.charset = OCR_CHARSETS[class_count]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported OCR output class count: {class_count}; "
+                "expected 37 or 63"
+            ) from exc
+        self.input_name = self.session.get_inputs()[0].name
+
+    @staticmethod
+    def prepare_blue_filter_inpaint(image_bytes: bytes) -> np.ndarray:
+        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("captcha bytes cannot be decoded as an image")
+        image = cv2.resize(image, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        line_mask = (hsv[:, :, 2] < 80).astype(np.uint8) * 255
+        line_mask = cv2.morphologyEx(
+            line_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        line_mask = cv2.dilate(
+            line_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6)),
+            iterations=1,
+        )
+        blue_mask = cv2.inRange(
+            hsv,
+            np.array([100, 50, 50]),
+            np.array([130, 255, 255]),
+        )
+        filtered = cv2.bitwise_and(image, image, mask=blue_mask)
+        filtered[blue_mask == 0] = [255, 255, 255]
+        return cv2.inpaint(filtered, line_mask, 3, cv2.INPAINT_TELEA)
+
+    @classmethod
+    def _prepare(cls, image_bytes: bytes, blue_filter: bool = False) -> np.ndarray:
+        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("captcha bytes cannot be decoded as an image")
+        if blue_filter:
+            image = cls.prepare_blue_filter_inpaint(image_bytes)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = cv2.resize(image, (130, 52), interpolation=cv2.INTER_AREA)
+        image = image.astype(np.float32) / 255.0
+        image = (image - 0.5) / 0.5
+        return image[None, None, :, :]
+
+    @staticmethod
+    def _softmax(logits: np.ndarray) -> np.ndarray:
+        logits = logits - logits.max(axis=-1, keepdims=True)
+        exponent = np.exp(logits)
+        return exponent / exponent.sum(axis=-1, keepdims=True)
+
+    def classification(self, image_bytes: bytes, blue_filter: bool = False) -> str:
+        logits = self.session.run(
+            None, {self.input_name: self._prepare(image_bytes, blue_filter)}
+        )[0]
+        probabilities = self._softmax(logits[:, 0, :])
+        beam: dict[tuple[str, ...], tuple[float, float]] = {(): (1.0, 0.0)}
+        for distribution in probabilities:
+            top_indices = np.argsort(distribution)[-20:][::-1]
+            next_beam: dict[tuple[str, ...], list[float]] = {}
+            for prefix, (blank_score, text_score) in beam.items():
+                for index in top_indices:
+                    probability = float(distribution[index])
+                    if index == 0:
+                        scores = next_beam.setdefault(prefix, [0.0, 0.0])
+                        scores[0] += (blank_score + text_score) * probability
+                        continue
+                    character = self.charset[index - 1]
+                    if prefix and prefix[-1] == character:
+                        same = next_beam.setdefault(prefix, [0.0, 0.0])
+                        same[1] += text_score * probability
+                        extended = next_beam.setdefault(prefix + (character,), [0.0, 0.0])
+                        extended[1] += blank_score * probability
+                    else:
+                        extended = next_beam.setdefault(prefix + (character,), [0.0, 0.0])
+                        extended[1] += (blank_score + text_score) * probability
+            beam = {
+                prefix: (scores[0], scores[1])
+                for prefix, scores in sorted(
+                    next_beam.items(), key=lambda item: sum(item[1]), reverse=True
+                )[:5]
+            }
+        if not beam:
+            raise ValueError("OCR beam search produced no candidate")
+        prefix, _ = max(beam.items(), key=lambda item: sum(item[1]))
+        return "".join(prefix)
 
 
 def mount_get_retries(session: requests.Session) -> None:
@@ -240,7 +347,7 @@ def ensure_password(credentials: Credentials, args: argparse.Namespace) -> None:
 def safe_label(label: str) -> str:
     normalized = label.strip().lower()
     if not LABEL_RE.fullmatch(normalized):
-        raise ValueError(f"ddddocr returned unsupported label: {label!r}")
+        raise ValueError(f"trained model returned unsupported label: {label!r}")
     return normalized
 
 
@@ -267,19 +374,8 @@ def prepare_dirs(root: Path) -> tuple[Path, Path, Path]:
     return raw, auto_labeled, review
 
 
-def make_ocr(model_path: Path) -> ddddocr.DdddOcr:
-    if not model_path.is_file():
-        raise FileNotFoundError(f"OCR model not found: {model_path}")
-    if model_path.name != "common_old.onnx":
-        raise ValueError(
-            "custom ddddocr models also need a matching charsets.json; "
-            "use the bundled common_old.onnx for this collector"
-        )
-    # ddddocr's bundled default is common_old.onnx.  The repository copy is
-    # checked above so collection is pinned to the model that was migrated
-    # with this project, while avoiding custom-model mode (which requires a
-    # separate charsets.json file).
-    return ddddocr.DdddOcr(old=True, show_ad=False)
+def make_ocr(model_path: Path) -> CaptchaOCR:
+    return CaptchaOCR(model_path)
 
 
 def collect(args: argparse.Namespace) -> int:
@@ -350,32 +446,10 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--delay", type=float, default=0.8)
     command.add_argument("--output-dir", default="data/collected")
     command.add_argument("--cookies-file", default=".session_cookies.json")
-    command.add_argument("--model", default="data/common_old.onnx")
+    command.add_argument("--model", default="data/captcha_mobilenet_ctc.onnx")
     command.add_argument("--reuse-cookies", action="store_true")
     command.set_defaults(handler=collect)
     return parser
-
-def preprocess_captcha(image_bytes: bytes) -> bytes:
-    """Remove dark interference lines using the logic from remove_line.py."""
-    image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError("captcha bytes cannot be decoded as an image")
-
-    image = cv2.resize(image, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    line_mask = (hsv[:, :, 2] < 80).astype(np.uint8) * 255
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, open_kernel)
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6))
-    line_mask = cv2.dilate(line_mask, dilate_kernel, iterations=1)
-    clean = cv2.inpaint(image, line_mask, 3, cv2.INPAINT_TELEA)
-
-    ok, encoded = cv2.imencode(".png", clean)
-    if not ok:
-        raise RuntimeError("encode line-removed captcha failed")
-    return encoded.tobytes()
-
-
 
 def build_session():
     session = requests.Session()
@@ -559,16 +633,7 @@ def prepare_dirs(root):
 
 
 def make_ocr(model_path):
-
-    if not model_path.is_file():
-        raise FileNotFoundError(
-            model_path
-        )
-
-    return ddddocr.DdddOcr(
-        old=True,
-        show_ad=False,
-    )
+    return CaptchaOCR(model_path)
 
 def collect(args):
 
@@ -625,6 +690,7 @@ def collect(args):
         )
 
 
+    verified_count = 0
     for index in range(
         1,
         args.count + 1
@@ -662,80 +728,23 @@ def collect(args):
                     time.sleep(args.delay)
             continue
 
-
-        # Only classes 3 and 5 contain interference lines.  Keep the raw
-        # candidate and the line-removed candidate for side-by-side evaluation.
-        processed_bytes = None
-        if captcha_class in {"class_3", "class_5"}:
-            try:
-                processed_bytes = preprocess_captcha(image_bytes)
-                processed_path = processed_dir / sample_name
-                processed_path.write_bytes(processed_bytes)
-            except Exception as exc:
-                print("line removal failed:", exc)
-
-
-
         status = "needs_manual_label"
         prediction = ""
-        ocr_source = ""
+        ocr_source = "trained_model"
         verified = False
         response_payload = None
-
-
-        candidates = [
-            (
-                "raw",
-                image_bytes,
+        try:
+            prediction = safe_label(ocr.classification(image_bytes))
+            verified, response_payload = verify_captcha_label(
+                session,
+                credentials.username,
+                prediction,
             )
-        ]
+        except Exception as exc:
+            response_payload = {"error": f"{type(exc).__name__}: {exc}"}
 
-
-        if processed_bytes:
-            candidates.append(
-                (
-                    "line_removed",
-                    processed_bytes,
-                )
-            )
-
-        for source, data in candidates:
-
-            try:
-
-                label = safe_label(
-                    ocr.classification(data)
-                )
-
-
-                ok, payload = (
-                    verify_captcha_label(
-                        session,
-                        credentials.username,
-                        label,
-                    )
-                )
-
-
-                if ok:
-
-                    prediction = label
-                    ocr_source = source
-                    verified = True
-                    response_payload = payload
-
-                    break
-
-
-                response_payload = payload
-
-
-            except Exception as exc:
-
-                response_payload = {
-                    "error":
-                        f"{type(exc).__name__}: {exc}"
-                }
+        if verified:
+            verified_count += 1
 
         if verified:
 
@@ -804,7 +813,8 @@ def collect(args):
             f"{status} "
             f"class={captcha_class} "
             f"label={prediction or '-'} "
-            f"source={ocr_source or '-'}"
+            f"source={ocr_source or '-'} "
+            f"correct={verified_count}/{index} ({verified_count / index:.2%})"
         )
 
 
@@ -818,6 +828,10 @@ def collect(args):
                 time.sleep(args.delay)
 
 
+    print(
+        f"summary: correct={verified_count}/{args.count} "
+        f"({verified_count / args.count:.2%})"
+    )
     return 0
 
 def build_parser():
@@ -873,7 +887,7 @@ def build_parser():
 
     cmd.add_argument(
         "--model",
-        default="data/common_old.onnx",
+        default="data/captcha_mobilenet_ctc.onnx",
     )
 
     cmd.add_argument(

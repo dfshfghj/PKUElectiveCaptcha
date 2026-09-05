@@ -10,6 +10,9 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pillow>=10",
     "requests>=2.31",
+    "onnx>=1.16",
+    "torch>=2.6",
+    "torchvision>=0.21",
 ]
 
 [dependency-groups]
