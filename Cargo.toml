@@ -9,9 +9,9 @@ chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 image = "0.25"
-ndarray = "0.16"
-ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
 reqwest = { version = "0.12", features = ["blocking", "cookies", "json", "rustls-tls"] }
+rten = "0.22"
+rten-tensor = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
