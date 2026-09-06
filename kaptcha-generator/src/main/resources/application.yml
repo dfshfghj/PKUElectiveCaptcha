@@ -1,0 +1,23 @@
+generator:
+  width: 130
+  height: 52
+  length: 5
+  lengths: "4,5"
+  charset: "2345678abcdefgmnpwxy"
+  format: png
+  profiles: "white-shadow-line,blue-shadow-line,white-outline-line,white-outline"
+  profile: white-shadow-line
+  font-names: "Arial"
+
+kaptcha:
+  image:
+    width: 130
+    height: 52
+  textproducer:
+    char:
+      length: 5
+      string: "0123456789abcdefghijklmnopqrstuvwxyz"
+  noise:
+    color: "0,0,0"
+  border:
+    enabled: false
